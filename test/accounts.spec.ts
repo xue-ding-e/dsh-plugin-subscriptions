@@ -124,6 +124,33 @@ test('legacy and canonical keys share one in-flight refresh', async () => {
   assert.equal(stored.has('canonical'), true)
 })
 
+test('an external read-only refresh does not persist or remove its owner session', async () => {
+  const stale = session('external-stale', 1000)
+  let saveCalls = 0
+  let removeCalls = 0
+  const tokens = new AccountTokenManager<TestSession>({
+    provider: 'codex',
+    displayName: 'External Test',
+    makeOptions: () => ({
+      preemptMs: 60_000,
+      persistRefresh: false,
+      removeOnPermanentFailure: false,
+      refresh: async current => ({ ...current, accessToken: 'external-current', expiresAt: Date.now() + 3_600_000 }),
+      isPermanent: () => true,
+    }),
+    io: {
+      list: () => Promise.resolve([{ key: 'external', session: stale }]),
+      get: () => Promise.resolve(stale),
+      save: () => { saveCalls += 1; return Promise.resolve() },
+      remove: () => { removeCalls += 1; return Promise.resolve() },
+    },
+  })
+  const refreshed = await tokens.session('external')
+  assert.equal(refreshed.accessToken, 'external-current')
+  assert.equal(saveCalls, 0)
+  assert.equal(removeCalls, 0)
+})
+
 test('a permanent refresh failure removes only that account and notifies once', async () => {
   const { tokens, stored, removed, notified } = harness({
     accounts: { a1: session('at-1', 1000), a2: session('at-2') },

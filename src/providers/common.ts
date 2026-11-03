@@ -335,8 +335,12 @@ export interface TokenManagerOptions<S extends TimedSession> {
   load(): Promise<S | undefined>
   save(session: S): Promise<void>
   remove(): Promise<void>
-  /** Perform the provider's refresh-token grant. */
+  /** Perform the provider's refresh-token grant, or re-read an external owner. */
   refresh(session: S): Promise<S>
+  /** Persist a refreshed session; false is used by read-only external sources. */
+  persistRefresh?: boolean
+  /** Keep credentials owned by an external source after a permanent failure. */
+  removeOnPermanentFailure?: boolean
   /** Whether a refresh failure is permanent (re-login required). */
   isPermanent(error: unknown): boolean
   /** Called after a permanent refresh failure deleted the stored session. */
@@ -410,16 +414,21 @@ export class TokenManager<S extends TimedSession> {
         if (stored !== undefined && attempted !== undefined && stored.refreshToken !== attempted.refreshToken) {
           return stored
         }
-        await this.options.remove()
-        this.options.onRemoved?.()
+        if (this.options.removeOnPermanentFailure !== false) {
+          await this.options.remove()
+          this.options.onRemoved?.()
+        }
         throw new LlmError(
           `${this.options.displayName} login expired or was revoked; log in again via Settings → Subscriptions`,
           'INVALID_CREDENTIAL',
           { cause: error },
         )
       }
-      if (!forceRefresh && session.expiresAt > Date.now()) {
-        // Transient refresh failure with a still-valid token: use it.
+      if (!(error instanceof LlmError && error.code === 'AUTH')
+        && !forceRefresh && session.expiresAt > Date.now()) {
+        // Transient refresh failure with a still-valid token: use it. External
+        // owner errors are AUTH and must reach the caller instead of silently
+        // reusing credentials the owning CLI has already replaced or removed.
         return session
       }
       throw error instanceof LlmError
@@ -440,7 +449,7 @@ export class TokenManager<S extends TimedSession> {
     const attempted = current ?? session
     this.attempted = attempted
     const next = await this.options.refresh(attempted)
-    await this.options.save(next)
+    if (this.options.persistRefresh !== false) await this.options.save(next)
     return next
   }
 }

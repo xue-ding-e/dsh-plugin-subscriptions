@@ -12,7 +12,7 @@ import type { HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 import type { RpcResult } from '../compat.js'
 import { AttachmentId } from '@deepseek-ai/dsh-attachment'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import { PROVIDER_IDS, type ProviderId } from './store.js'
+import { listAccounts, PROVIDER_IDS, type AccountEntry, type ProviderId, type StoredSession } from './store.js'
 import type { ProviderUsage } from '../providers/common.js'
 import type { ProxyConfigView, ProxyDraft, ProxyInput, ProxyTestResult } from '../http.js'
 import type { CliVersion } from '../providers/npm-cli-version.js'
@@ -102,6 +102,8 @@ export interface ProviderStatus {
   displayName?: string
   /** Whether a login attempt is currently waiting for its code. */
   busy: boolean
+  /** Credential source without exposing token values. */
+  source?: { kind: 'plugin' | 'native'; path?: string; readOnly: boolean }
   /** Logged-in accounts, default first. */
   accounts: AccountStatus[]
   /** The last login error, shown until the next success. */
@@ -112,6 +114,12 @@ export interface ProviderStatus {
 
 /** How a Claude login should acquire credentials (other providers ignore it). */
 export type LoginMethod = 'oauth' | 'keychain'
+
+/** Provider account operations used by status and explicit account actions. */
+export interface AuthAccountStore {
+  readonly source: NonNullable<ProviderStatus['source']>
+  list(): Promise<readonly AccountEntry<StoredSession>[]>
+}
 
 /** Proxy config operations behind the `proxyGet/proxySet/proxyTest` endpoints. */
 export interface ProxyConfigController {
@@ -175,6 +183,8 @@ export interface AuthController {
   consumeReset?(account: string, ticket: string, signal: AbortSignal): Promise<void>
   /** Current status of one provider. */
   status(provider: ProviderId): Promise<ProviderStatus>
+  /** Redacted source metadata remains available when account enumeration fails. */
+  source?(provider: ProviderId): ProviderStatus['source']
   /**
    * Start a background login attempt.
    * @param provider - the provider route.
@@ -548,6 +558,10 @@ async function dispatch(
           busy: false,
           accounts: [],
           detail: error instanceof Error ? error.message : String(error),
+          ...(() => {
+            const source = controller.source?.(provider)
+            return source === undefined ? {} : { source }
+          })(),
         }) satisfies ProviderStatus)] as const,
       ))
       return ok({ providers: Object.fromEntries(entries.map(([provider, status]) => {

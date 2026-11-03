@@ -9,7 +9,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { errorChain } from '@deepseek-ai/dsh-llm'
+import { errorChain, LlmError } from '@deepseek-ai/dsh-llm'
 import type {
   AdapterRegistrationHandle,
   GenerateOptions,
@@ -25,6 +25,7 @@ import type {} from '@deepseek-ai/dsh-web'
 import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { OAuthFlowManager, type OAuthAttempt } from './auth/oauth-flow.js'
 import { DeviceFlowManager, type DeviceAttempt } from './auth/device-flow.js'
+import { createNativeStore, selectAuthSource, type NativeAuthSourceConfig, type NativeStore, type SelectedAuthSource } from './auth/native.js'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { readClaudeCodeCredentials, refreshClaudeSynced } from './auth/claude-code-creds.js'
@@ -32,6 +33,7 @@ import { ResetRedemption } from './providers/reset-redemption.js'
 import { BadRequest, registerAuthRpc } from './auth/rpc.js'
 import type {
   AuthController,
+  AuthAccountStore,
   ImageBytesResult,
   LoginMethod,
   ModelDefaultsCatalog,
@@ -63,6 +65,7 @@ import type {
   GrokSession,
   ProviderId,
   StoredSession,
+  AccountEntry,
 } from './auth/store.js'
 import { DISCOVERY_TIMEOUT_MS, validateModels, withTimeout } from './providers/common.js'
 import { startCatalogRefresh } from './providers/catalog-refresh.js'
@@ -183,6 +186,16 @@ export interface Config {
     copilot?: ModelEntry[]
     antigravity?: ModelEntry[]
   }
+  /**
+   * Read provider-native runtime credentials instead of the plugin-owned store.
+   * Native mode is read-only by default; set `mode: native` or `mode: auto`
+   * explicitly to use the native file. Codex and Grok are supported first because
+   * their CLI auth.json formats are stable.
+   */
+  nativeAuth?: {
+    codex?: NativeAuthSourceConfig
+    grok?: NativeAuthSourceConfig
+  }
   /** Antigravity-specific OAuth and endpoint configuration. */
   antigravity?: AntigravityRuntimeConfig & {
     /** Google OAuth client id. May instead be supplied as ANTIGRAVITY_CLIENT_ID. */
@@ -240,6 +253,18 @@ export const Config: z<Config> = z.object({
     grok: z.array(modelEntrySchema),
     copilot: z.array(modelEntrySchema),
     antigravity: z.array(modelEntrySchema),
+  }),
+  nativeAuth: z.object({
+    codex: z.object({
+      mode: z.union(['plugin', 'native', 'auto']).default('plugin'),
+      path: z.string(),
+      readOnly: z.boolean().default(true),
+    }),
+    grok: z.object({
+      mode: z.union(['plugin', 'native', 'auto']).default('plugin'),
+      path: z.string(),
+      readOnly: z.boolean().default(true),
+    }),
   }),
   antigravity: z.object({
     clientId: z.string(),
@@ -427,6 +452,8 @@ export class SubscriptionsAuthController implements AuthController {
      * failure must not outlive an explicit re-check (issue #139).
      */
     private readonly onUsageForced?: (provider: ProviderId, account: string) => void,
+     /** Provider-native stores replace the plugin-owned store for selected routes. */
+     private readonly accountStores: Partial<Record<ProviderId, AuthAccountStore>> = {},
   ) {}
 
   prepareReset(account: string, signal: AbortSignal) {
@@ -463,13 +490,20 @@ export class SubscriptionsAuthController implements AuthController {
     return { mediaType: 'video/mp4', dataBase64: data.toString('base64') }
   }
 
+  source(provider: ProviderId): ProviderStatus['source'] {
+    const source = this.accountStores[provider]?.source
+    return source
+  }
+
   async status(provider: ProviderId): Promise<ProviderStatus> {
-    const entries = await listAccounts(provider)
+    const entries = await (this.accountStores[provider]?.list() ?? listAccounts(provider))
     // The plan name is shown by the usage section, so `detail` only carries errors.
     const detail = this.lastError.get(provider)
     const clientVersion = await this.clientVersions[provider]?.()
+    const source = this.accountStores[provider]?.source
     return {
       busy: this.flows.isBusy(provider) || this.deviceFlows.isBusy(provider) || this.finalizing.has(provider),
+      ...source === undefined ? {} : { source },
       accounts: entries.map(({ key, session }, index) => {
         const account = accountOf(provider, session)
         const plan = planOf(provider, session)
@@ -487,6 +521,9 @@ export class SubscriptionsAuthController implements AuthController {
   }
 
   async login(provider: ProviderId, method?: LoginMethod): Promise<{ authorizeUrl: string; userCode?: string }> {
+    if (this.accountStores[provider] !== undefined) {
+      throw new Error('this provider is managed by its native CLI/tool; log in or switch accounts there instead')
+    }
     if (provider === 'claude' && method !== 'oauth') {
       const imported = this.readClaudeCreds()
       if (imported !== undefined) {
@@ -668,12 +705,16 @@ export class SubscriptionsAuthController implements AuthController {
     this.claim(provider)
     this.flows.pending(provider)?.cancel()
     this.deviceFlows.pending(provider)?.cancel()
+    const external = this.accountStores[provider]
+    if (external) throw new Error('this provider is managed by its native CLI/tool; log out there instead')
     await deleteAccountSession(provider, account)
     this.lastError.delete(provider)
     this.onAuthChanged(provider, account)
   }
 
   async setDefault(provider: ProviderId, account: string): Promise<void> {
+    const external = this.accountStores[provider]
+    if (external) throw new Error('this provider is managed by its native CLI/tool; switch the active account there instead')
     await setDefaultAccount(provider, account)
     this.onAuthChanged(provider, account)
   }
@@ -716,6 +757,12 @@ export function apply(ctx: Context, config: Config): void {
   const codexVersion = new CodexClientVersionCache()
   const claudeVersion = new ClaudeCliVersionCache()
   const providers = [...new Set(config.providers ?? [...PROVIDER_IDS])]
+  const nativeSources = new Map<ProviderId, SelectedAuthSource>()
+  for (const provider of ['codex', 'grok'] as const) {
+    if (!providers.includes(provider)) continue
+    const source = selectAuthSource(provider, config.nativeAuth?.[provider])
+    nativeSources.set(provider, source)
+  }
   const streamIdleTimeoutMs = config.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS
   if (!Number.isFinite(streamIdleTimeoutMs) || streamIdleTimeoutMs <= 0) {
     throw new Error(`${name}: streamIdleTimeoutMs must be a positive finite number`)
@@ -793,6 +840,14 @@ export function apply(ctx: Context, config: Config): void {
   // Usage lookups resolve the session through the refresh-aware path, so an
   // expired access token renews instead of failing the lookup.
   const usageFetchers: UsageFetchers = {}
+  // Native stores are provider-specific and expose the currently active CLI
+  // account as one read-only account. The plugin-owned store remains the
+  // fallback for providers without a native source or when `mode: plugin` is set.
+  const nativeStores = new Map<ProviderId, NativeStore<CodexSession> | NativeStore<GrokSession>>()
+  const codexSource = nativeSources.get('codex')
+  if (codexSource?.kind === 'native') nativeStores.set('codex', createNativeStore('codex', codexSource))
+  const grokSource = nativeSources.get('grok')
+  if (grokSource?.kind === 'native') nativeStores.set('grok', createNativeStore('grok', grokSource))
   // Explicit Speed choices are per-session and reset on restart. Subagents
   // without an explicit choice use their persisted model default. Every
   // request still gates Fast on the model's discovered capability.
@@ -827,12 +882,25 @@ export function apply(ctx: Context, config: Config): void {
         const tokens = new AccountTokenManager<CodexSession>({
           provider: 'codex',
           displayName: 'ChatGPT (Codex)',
-          makeOptions: () => ({
+          makeOptions: (account) => ({
             preemptMs: CODEX_PREEMPT_MS,
-            refresh: refreshCodex,
+            refresh: async (session) => {
+              const source = nativeSources.get('codex')
+              const native = nativeStores.get('codex') as NativeStore<CodexSession> | undefined
+              if (source?.readOnly === true && native !== undefined) {
+                const current = await native.get(account)
+                if (current === undefined) throw new LlmError('native Codex credentials are unavailable; refresh them with the owning CLI/tool', 'AUTH')
+                if (current.expiresAt <= Date.now()) throw new LlmError('native Codex credentials are expired; refresh them with the owning CLI/tool', 'AUTH')
+                return current
+              }
+              return refreshCodex(session)
+            },
+            persistRefresh: nativeSources.get('codex')?.readOnly !== true,
+            removeOnPermanentFailure: nativeSources.get('codex')?.kind !== 'native',
             isPermanent: isCodexPermanentRefreshError,
           }),
           onAccountRemoved: account => { authChanged('codex', account) },
+          ...nativeStores.has('codex') ? { io: nativeStores.get('codex') as NativeStore<CodexSession> } : {},
         })
         codexTokens = tokens
         accountTokens.set('codex', tokens as AccountTokenManager<StoredSession>)
@@ -921,12 +989,25 @@ export function apply(ctx: Context, config: Config): void {
         const tokens = new AccountTokenManager<GrokSession>({
           provider: 'grok',
           displayName: 'Grok (Subscription)',
-          makeOptions: () => ({
+          makeOptions: (account) => ({
             preemptMs: GROK_PREEMPT_MS,
-            refresh: refreshGrok,
+            refresh: async (session) => {
+              const source = nativeSources.get('grok')
+              const native = nativeStores.get('grok') as NativeStore<GrokSession> | undefined
+              if (source?.readOnly === true && native !== undefined) {
+                const current = await native.get(account)
+                if (current === undefined) throw new LlmError('native Grok credentials are unavailable; refresh them with the owning CLI/tool', 'AUTH')
+                if (current.expiresAt <= Date.now()) throw new LlmError('native Grok credentials are expired; refresh them with the owning CLI/tool', 'AUTH')
+                return current
+              }
+              return refreshGrok(session)
+            },
+            persistRefresh: nativeSources.get('grok')?.readOnly !== true,
+            removeOnPermanentFailure: nativeSources.get('grok')?.kind !== 'native',
             isPermanent: isGrokPermanentRefreshError,
           }),
           onAccountRemoved: account => { authChanged('grok', account) },
+          ...nativeStores.has('grok') ? { io: nativeStores.get('grok') as NativeStore<GrokSession> } : {},
         })
         grokTokens = tokens
         accountTokens.set('grok', tokens as AccountTokenManager<StoredSession>)
@@ -1248,6 +1329,18 @@ export function apply(ctx: Context, config: Config): void {
     },
     account => poolUsage?.invalidate('codex', account),
   )
+  const authAccountStores: Partial<Record<ProviderId, AuthAccountStore>> = {}
+  for (const provider of ['codex', 'grok'] as const) {
+    const source = nativeSources.get(provider)
+    const store = nativeStores.get(provider)
+    if (source?.kind === 'native' && store !== undefined) {
+      authAccountStores[provider] = {
+        source,
+        list: () => store.list() as Promise<readonly AccountEntry<StoredSession>[]>,
+
+      }
+    }
+  }
   registerAuthRpc(ctx, new SubscriptionsAuthController(
     flows, deviceFlows, authChanged, resolveAttachments, usageFetchers, undefined, poolUsage, config.antigravity,
     {
@@ -1260,6 +1353,7 @@ export function apply(ctx: Context, config: Config): void {
     },
     resetRedemption,
     (provider, account) => poolHealth?.clear(provider, account),
+    authAccountStores,
   ), speed, {
     get: () => proxyGetConfig(),
     set: input => proxySetConfig(input),

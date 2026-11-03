@@ -56,6 +56,7 @@ export interface ProviderStatus {
   detail?: string
   /** The CLI version the route presents (Codex, Claude), and where it came from. */
   clientVersion?: { version: string; source: ClientVersionSource }
+  source?: { kind: 'plugin' | 'native'; path?: string; readOnly: boolean }
 }
 
 export type ClientVersionSource = 'npm' | 'local' | 'fallback' | 'config'
@@ -316,6 +317,12 @@ function statusText(t: SubscriptionsSectionInjected['t'], status: ProviderStatus
   if (status.busy) return t('loginInProgress')
   if (status.accounts.length > 0) return t('loggedInCount', { count: status.accounts.length })
   return t('notLoggedIn')
+}
+
+/** Redacted source label; native paths are intentionally not rendered. */
+function authSourceText(t: SubscriptionsSectionInjected['t'], status: ProviderStatus | undefined): string | undefined {
+  if (status?.source === undefined) return undefined
+  return status.source.kind === 'native' ? t('authSourceNative') : t('authSourcePlugin')
 }
 
 /**
@@ -864,6 +871,9 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
               <ClientVersionTag clientVersion={status?.clientVersion} t={t} />
             </div>
             <p style={styles.statusLine}>{statusText(t, status)}</p>
+            {authSourceText(t, status) !== undefined && (
+              <p style={styles.statusLine} title={t('authSourceHint')}>{authSourceText(t, status)}</p>
+            )}
             {status?.detail !== undefined && status.detail !== '' && (
               <p style={styles.statusLine}>{status.detail}</p>
             )}
@@ -884,7 +894,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
               return (
                 <div key={account.key} style={styles.accountRow}>
                   <div style={styles.accountHeader}>
-                    <button
+                    {status?.source?.kind !== 'native' && <button
                       type="button"
                       style={styles.starButton}
                       title={account.isDefault ? t('defaultBadge') : t('setDefault')}
@@ -893,7 +903,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                       }}
                     >
                       {account.isDefault ? '★' : '☆'}
-                    </button>
+                    </button>}
                     <span style={styles.accountName}>{display}</span>
                     {account.plan !== undefined && (
                       <span style={styles.usagePlan}>{account.plan}</span>
@@ -903,13 +913,13 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                         {t('accountExpires', { date: new Date(account.expiresAt).toLocaleString() })}
                       </span>
                     )}
-                    <button
+                    {status?.source?.kind !== 'native' && <button
                       type="button"
                       style={{ marginLeft: 'auto', flexShrink: 0 }}
                       onClick={() => { void logout(id, account.key, display, name) }}
                     >
                       {t('logout')}
-                    </button>
+                    </button>}
                   </div>
                   {showUsage && (
                     <div style={styles.usage}>
@@ -1001,12 +1011,12 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
               )
             })}
             <div style={styles.actions}>
-              {!busy && accounts.length === 0 && (
+              {!busy && accounts.length === 0 && status?.source?.kind !== 'native' && (
                 <button type="button" onClick={() => { void login(id) }}>
                   {t('login')}
                 </button>
               )}
-              {!busy && accounts.length > 0 && id === 'claude' && (
+              {!busy && accounts.length > 0 && status?.source?.kind !== 'native' && id === 'claude' && (
                 <>
                   <button type="button" onClick={() => { void login(id, 'oauth') }}>
                     {t('addAccountOAuth')}
@@ -1016,13 +1026,13 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                   </button>
                 </>
               )}
-              {!busy && accounts.length > 0 && id !== 'claude' && (
+              {!busy && accounts.length > 0 && status?.source?.kind !== 'native' && id !== 'claude' && (
                 <button type="button" onClick={() => { void login(id) }}>
                   {t('addAccount')}
                 </button>
               )}
               {/* 与同排其它按钮一致：登录/取消进行中不开第二个写配置的弹窗。 */}
-              {!busy && <button type="button" aria-haspopup="dialog"
+              {!busy && status?.source?.kind !== 'native' && <button type="button" aria-haspopup="dialog"
                 onClick={() => setManagedProvider({ id, name })}>
                 {t('accountsManage')}
               </button>}
@@ -1033,7 +1043,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                 </button>
               )}
             </div>
-            {!busy && accounts.length > 0 && (
+            {!busy && accounts.length > 0 && status?.source?.kind !== 'native' && (
               <p style={styles.statusLine}>{t('addAccountHint')}</p>
             )}
 
